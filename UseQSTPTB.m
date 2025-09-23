@@ -13,10 +13,11 @@ switch lower(action)
         % as global (global qst;)
         %-----------------------------------------------------------
         oldverbosity = IOPort('Verbosity', 0);
-        [h, errmsg] = IOPort('OpenSerialPort', varargin{1},'BaudRate=115200,DTR=1,RTS=1');
+        [h, errmsg] = IOPort('OpenSerialPort', varargin{1},'BaudRate=115200,DTR=1,RTS=1,');
         if h >= 0
             IOPort('Close', h); %OK Port exists and can be opened
-        elseif isempty(strfind(errmsg, 'ENOENT'))
+        %elseif isempty(strfind(errmsg, 'ENOENT'))
+        elseif (any(strfind(errmsg, 'already open')) && IsLinux) || (any(strfind(errmsg, 'grant access')) && IsWin)            
             error([varargin{1} ' is already open']);
         else
             error([varargin{1} ' does not exist']);
@@ -49,7 +50,7 @@ switch lower(action)
         %-----------------------------------------------------------
     case 'gettemp'  % UseQSTPTB('gettemp',Index) --> returns the temps of QST Index
         % UseQSTPTB('gettemp') --> returns the temps of 1st QST
-        % temps in °C [ambient T1 T2 T3 T4 T5]
+        % temps in Â°C [ambient T1 T2 T3 T4 T5]
         % outpout [when, temps]
         %-----------------------------------------------------------
         if numel(varargin) == 1
@@ -61,7 +62,44 @@ switch lower(action)
             IOPort('Purge',qst(ind).handle);
             [resp, when] = mywriteread(qst(ind).handle,"E",24);
             varargout{1} = when;
-            varargout{2} = sscanf(char(resp),'%3d %4d %4d %4d %4d %4d')'./10;
+            varargout{2} = sscanf(char(resp),'%*c %3d %4d %4d %4d %4d %4d')'./10;
+        else
+            error(['QST ' num2str(ind) ' does not exist']);
+        end
+        %-----------------------------------------------------------
+    case 'selectzones'  % UseQSTPTB('selectzone',zones,Index) --> select zones for QST Index
+        % UseQSTPTB('selectzone',zones) --> select zones for 1st QST
+        % zones = 1x5 e.g. [0 0 0 0 0] all off, [0 0 3 0 0] third on
+        % 
+        %-----------------------------------------------------------
+        zones = varargin{1};
+        if numel(varargin) == 2
+            ind = varargin{2};
+        else
+            ind = 1;
+        end
+        if ind <= numel(qst)
+            IOPort('Purge',qst(ind).handle);
+            mywrite(qst(ind).handle,sprintf('S%d%d%d%d%d',zones));
+        else
+            error(['QST ' num2str(ind) ' does not exist'])
+        end
+        %-----------------------------------------------------------
+    case 'setbaseline'  % UseQSTPTB('setbaseline',temp,Index) --> select baseline temp for QST Index
+        % UseQSTPTB('setbaseline',temp) --> select baseline temp for 1st QST
+        % temp in Â°C 
+        % 
+        %-----------------------------------------------------------
+        temp = varargin{1};
+        if numel(varargin) == 2
+            ind = varargin{2};
+        else
+            ind = 1;
+        end
+        if ind <= numel(qst)
+            IOPort('Purge',qst(ind).handle);
+            mywrite(qst(ind).handle,sprintf('N%03d', temp*10));
+            qst(ind).t_init = repmat(temp,1,5);
         else
             error(['QST ' num2str(ind) ' does not exist'])
         end
@@ -77,7 +115,7 @@ switch lower(action)
         end
         if ind <= numel(qst)
             IOPort('Purge',qst(ind).handle);
-            [resp, when] = mywriteread(qst(ind).handle,"B",14);
+            [resp, ~] = mywriteread(qst(ind).handle,"B",14);
             battery      = sscanf(char(resp),'%f%*c%d%%')';
             varargout{1} = battery(1);
             varargout{2} = battery(2);
@@ -87,7 +125,7 @@ switch lower(action)
         %-----------------------------------------------------------
     case 'prepareramp'  % UseQSTPTB('prepareramp',params, Index) --> prepare ramps for QST Index
         % UseQSTPTB('prepareramp',params) --> prepare ramps for 1st QST
-        % params = [1/5 x 4 matrix with 5 zones x [duration(s) rampspeed(°/s) returnspeed(°/s) temperature(°C)]
+        % params = [1/5 x 4 matrix with 5 zones x [duration(s) rampspeed(ï¿½/s) returnspeed(ï¿½/s) temperature(ï¿½C)]
         % if size(params,1) == 1 we apply these to all zones
         %-----------------------------------------------------------
         params = varargin{1};
@@ -118,7 +156,7 @@ switch lower(action)
                     qst(ind).down(1,z) = params(z,3); 
                     mywrite(qst(ind).handle,sprintf('C%d%03d',z, round(params(z,4)*10)));   % set temperature
                     qst(ind).t(1,z) = params(z,4);
-                    qst(ind).total(1,z)  = params(z,1)+abs(params(z,4)-qst(ind).t_init)./params(z,3);
+                    qst(ind).total(1,z)  = params(z,1)+abs(params(z,4)-qst(ind).t_init(z))./params(z,3);
                 end
             end
         else
@@ -148,7 +186,7 @@ switch lower(action)
                 ii = 1;
                 while (GetSecs-start) < (max(qst(ind).total) + 1) % record 1s more
                     [resp,t] = mywriteread(qst(ind).handle,"E",24);
-                    temps(ii,:) = [t sscanf(char(resp),'%3d %4d %4d %4d %4d %4d')'./10];
+                    temps(ii,:) = [t sscanf(char(resp),'%*c %3d %4d %4d %4d %4d %4d')'./10];
                     ii = ii + 1;
                 end
                 varargout{2} = temps;
@@ -171,16 +209,10 @@ end
 end
 
 %-----------------------------------------------------
-function [resp, when] = mywriteread(s,str,n)
+function [resp, when_r] = mywriteread(s,str,n)
 % wait for n bytes
-t_out = 1; %timeout 1s
-resp  = [];
-[~, when, ~, ~, ~, ~] = IOPort('Write', s, char(str));
-elapsed = 0;
-while (IOPort('BytesAvailable',s) < n) && (elapsed < t_out) %get busy until we have enough data or time_out
-    elapsed = GetSecs-when;
-end
-resp = IOPort('Read', s);
+[~, when_w, ~, ~, ~, ~] = IOPort('Write', s, char(str));
+[resp, when_r] = IOPort('Read', s,1,n);
 end
 
 %-----------------------------------------------------
